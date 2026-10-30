@@ -1,0 +1,209 @@
+---
+title: "AIV Classification manuscript"
+output: html_document
+date: "2024-01-09"
+---
+
+# VARIABLES
+
+```{sh}
+TEMPDIR="$HOME/temp_AIVms"
+mkdir -p $TEMPDIR
+export PATH="$PATH:$HOME/seqtk"
+module load parallel/20210622-GCCcore-10.3.0
+
+
+module load Anaconda3
+source activate famsa
+
+```
+
+## Preparation
+
+```{sh}
+
+# install missing fasttree
+wget http://www.microbesonline.org/fasttree/FastTree -O fasttree
+chmod +x fasttree
+
+# install missing gotree
+wget https://github.com/evolbioinfo/gotree/releases/download/v0.4.5/gotree_v0.4.5_amd64_linux -O gotree
+chmod +x gotree
+
+# install seqtk for fasta processing
+git clone https://github.com/lh3/seqtk.git;
+cd seqtk; make ; cd
+
+# install FAMSA
+module load Anaconda3
+conda create -n famsa
+source activate famsa
+conda install -c conda-forge libstdcxx-ng=12
+conda install bioconda::famsa
+conda install bioconda::cd-hit
+ 
+# install TrimAl
+conda install bioconda::trimal
+
+# instal seqkit (for deduplication
+conda install seqkit
+
+```
+
+# Metadata 
+
+```{sh}
+# Table ID and sequence name
+for file in $TEMPDIR/African_H5_Avian_27052024.fa $TEMPDIR/GISAID_HPAI_NAmerica_05042024.fasta $TEMPDIR/GISAID_H5SequenceAvian_04102024.fa $TEMPDIR/USA_H5_Animal_27052024.fa; do
+  cat $file | fgrep '>' | sed 's/\r$//'| awk -F"|" '{print $5 "\t" $2}' | sort | uniq -c | awk '{if($1>=8) print $2 "\t" $3}' 
+done | sort | uniq > $TEMPDIR/temp_Metadata.txt
+sed -i 's/(//g' $TEMPDIR/temp_Metadata.txt 
+sed -i 's/)//g' $TEMPDIR/temp_Metadata.txt 
+
+
+```
+
+
+# Fasta Prep
+
+```{sh}
+
+# length check
+sed 's/\r$//' $TEMPDIR/GISAID_H5SequenceAvian_04102024.fa | perl $HOME/LenCutter.pl - > $TEMPDIR/full_raw.fa
+sed 's/\r$//' $TEMPDIR/GISAID_HPAI_NAmerica_05042024.fasta | perl $HOME/LenCutter.pl - >> $TEMPDIR/full_raw.fa
+sed 's/\r$//' $TEMPDIR/USA_H5_Animal_27052024.fa | perl $HOME/LenCutter.pl - >> $TEMPDIR/full_raw.fa
+sed 's/\r$//' $TEMPDIR/African_H5_Avian_27052024.fa | perl $HOME/LenCutter.pl - >> $TEMPDIR/full_raw.fa
+
+# change header name to ID_Segment
+cat $TEMPDIR/full_raw.fa | awk -F"|" '/^>/ {print ">" $5 "_" $3; next} 1' > $TEMPDIR/simpleNames.fa
+sed -i 's/EPI_ISL_/EPIISL/' $TEMPDIR/simpleNames.fa
+
+# clean out non IUPAC
+perl $HOME/fastaNucCleaner.pl $TEMPDIR/simpleNames.fa > $TEMPDIR/clean.fa
+# deduplicate
+awk '/^>/ {printf("%s%s\t",(N>0?"\n":""),$0);N++;next;} {printf("%s",$0);} END {printf("\n");}' $TEMPDIR/clean.fa | sort -t$'\t' -k1,1 -u | tr "\t" "\n" > $TEMPDIR/distinct.fa
+
+# split ( and deduplicate)
+mkdir -p $TEMPDIR/singleGeno
+cat $TEMPDIR/distinct.fa | fgrep '>' | awk -F"_" '{print $1}' | sed 's/>//' | sort | uniq | while read line; do
+  NAME=`echo $line`
+  echo $NAME
+  OUT=`echo $TEMPDIR/singleGeno/${NAME}.fa`
+  fgrep "${line}_" $TEMPDIR/distinct.fa | sed 's/>//g' | sort | uniq > $TEMPDIR/tempNames.txt
+  seqtk subseq $TEMPDIR/distinct.fa $TEMPDIR/tempNames.txt | awk '/^>/{if(N>0) printf("\n"); ++N; printf("%s\t",$0);next;} {printf("%s",$0);}END{printf("\n");}' |sort -k1,1 -u | tr '\t' '\n' > $OUT
+done
+
+# check if all files contain 8 segments
+# make a list of files
+fgrep '>' $TEMPDIR/singleGeno/*fa | awk -F":" '{print $1}' | sort | uniq -c | awk '{if($1 == 8) print $2}' > ${TEMPDIR}/nomiFasta.txt
+# remove others (double entries, 16 segments)
+ls $TEMPDIR/singleGeno/*fa | fgrep -vf ${TEMPDIR}/nomiFasta.txt | while read line; do rm $line; done
+
+# make list with good samples for analysis
+ls $HOME/temp_AIVms/singleGeno/*.fa | while read line; do NOME=`basename $line .fa | sed 's/EPIISL/EPI_ISL_/'`; echo $NOME; done > $HOME/temp_AIVms/analizedSamples.txt
+
+
+```
+
+
+## US Classification
+
+Installation GenoFLU v 1.06
+genin2 v.2.1.3
+https://github.com/USDA-VS/GenoFLU
+
+```{sh}
+module load Anaconda3
+conda create -n GenoFLu2 python=3.10 -c conda-forge -y
+source activate GenoFLu2
+conda install GenoFlU "numpy<2" pandas "scikit-learn=1.6.1" biopython click requests joblib -c conda-forge -c bioconda -y
+conda install importlib_resources -c conda-forge -y
+cd $TEMPDIR
+git clone https://github.com/izsvenezie-virology/genin2
+cd genin2
+/storage/homefs/mw23o336/.conda/envs/GenoFLu2/bin/python -m pip install --no-cache-dir genin2
+```
+
+```{sh}
+module load Anaconda3
+source activate GenoFLu
+
+# genotype using GenoFlu$
+mkdir -p $TEMPDIR/genoflu_out
+# because of bad programming, needs to be run in folder with fasta, only one after the other
+cd $TEMPDIR/singleGeno/
+sbatch --ntasks=1 --cpus-per-task=1 $TEMPDIR/submissionUSA.sh
+cd
+
+# merge US class
+find "$TEMPDIR/genoflu_out" -maxdepth 1 -name 'USclass_*.tsv' | while read line; do awk -F"\t" '{print $3 "\t" $4}' $line | fgrep 'File Name'; done | head -n1 > $TEMPDIR/US_classification.txt
+find "$TEMPDIR/genoflu_out" -maxdepth 1 -name 'USclass_*.tsv' | while read line; do awk -F"\t" '{print $3 "\t" $4}' $line | fgrep -v 'File Name'; done >> $TEMPDIR/US_classification.txt
+
+```
+
+
+## European Classification
+https://github.com/izsvenezie-virology/genin2
+
+```{sh}
+module load Anaconda3
+conda create -n genin2 
+source activate GenoFLu2
+conda install anaconda::pip
+pip install genin2
+pip install --upgrade genin2
+```
+
+
+```{sh}
+module load Anaconda3
+source activate genin2
+
+mkdir -p $TEMPDIR/genin2_out
+
+# classify (and header modification)
+# update pip install --upgrade genin2 
+# ln -s ~/.local/bin/genin2 ~/.conda/envs/GenoFLu/bin/genin2
+sbatch --ntasks=1 --cpus-per-task=1 $TEMPDIR/submissionEU.sh
+
+# make single file
+cat $TEMPDIR/genin2_out/*tsv | fgrep -v Sub-genotype | awk '{print $1 "\t" $2}' > $TEMPDIR/EU_classification.txt
+
+```
+
+## distance matrix
+
+```{sh}
+source activate famsa
+
+# split up into fasta for each segment
+mkdir -p $TEMPDIR/eachSeg
+rm $TEMPDIR/eachSeg/*
+for SEG in HA MP NA NP NS PA PB1 PB2; do
+  fgrep "_$SEG" $TEMPDIR/clean.fa | sort | uniq | sed 's/>//' > $TEMPDIR/eachSeg/tempNames
+  seqtk subseq $TEMPDIR/clean.fa $TEMPDIR/eachSeg/tempNames > $TEMPDIR/eachSeg/Segment_$SEG.fa
+done
+
+# calculate distance
+ls $TEMPDIR/eachSeg/Segment_*.fa > $TEMPDIR/fileToAlign.txt
+sbatch --ntasks=1 --cpus-per-task=20 $TEMPDIR/submissionALN.sh
+#Segment_NP.DistMatrix
+
+
+# cluster each trimmed sequence
+for SEG in HA MP NA NP NS PA PB1 PB2; do
+  sed 's/-//g' $TEMPDIR/Segment_${SEG}_trimmed.aln > $TEMPDIR/eachSeg/Segment_${SEG}_trimmed.fa
+done
+
+for SEG in HA MP NA NP NS PA PB1 PB2; do
+  sbatch --job-name="Ref_clust" --mem-per-cpu=50G --cpus-per-task=10 --wrap "cd-hit-est -i $TEMPDIR/eachSeg/Segment_${SEG}_trimmed.fa -o $TEMPDIR/eachSeg/Segment_$SEG.est -c 0.95 -n 10 -d 0 -M 500000 -T 10"
+done
+
+# make list of references
+for SEG in HA MP NA NP NS PA PB1 PB2; do
+  fgrep '>' $TEMPDIR/eachSeg/Segment_$SEG.est | sed 's/>//' | awk '{print $0 "\t" var}' var=$SEG
+done > $TEMPDIR/ReferenceNames.txt
+
+
+```
+
